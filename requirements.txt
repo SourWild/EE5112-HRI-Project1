@@ -1,0 +1,22 @@
+# Core LLM Dependencies (Task 1, 2, 4)
+llama-cpp-python>=0.2.0
+
+# Task 1: Model Download
+huggingface_hub>=0.16.0
+
+# Task 2: Chat System
+rich>=13.0.0
+psutil>=5.9.0
+requests>=2.31.0
+
+# Task 4: GUI Interface
+# tkinter is included with Python standard library
+
+# Task 5: Multimodal LLM (LLaVA) - Core dependencies only
+torch>=2.1.2
+torchvision>=0.16.2
+transformers>=4.37.2
+tokenizers>=0.15.1
+accelerate>=0.21.0
+Pillow>=10.0.0
+requests>=2.31.0
