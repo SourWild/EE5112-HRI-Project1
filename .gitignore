@@ -61,7 +61,7 @@ task5/llava_project/LLaVA/checkpoints/
 # Logs and runs
 runs/
 *.log
-*.txt
+# Note: requirements.txt is needed, so not ignoring all .txt files
 
 # Jupyter Notebook
 .ipynb_checkpoints
