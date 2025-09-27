@@ -1,180 +1,27 @@
-import os
 import time
-from typing import Any, Dict, List, Optional
 import traceback
 
 import psutil
-from llama_cpp import Llama
 
-
-class ChatBot:
-    """
-    A thin wrapper around llama.cpp that:
-      - Supports multi-turn chat with context.
-      - Auto-selects the best prompting strategy based on the model file name.
-      - Falls back gracefully if a path produces an empty reply.
-    """
-
-    def __init__(
-        self,
-        model_path: str,
-        sys_prompt: str = "You are a helpful, concise assistant.",
-        n_ctx: int = 2048,
-        n_threads: int = 4,
-        n_gpu_layers: int = 20,
-        verbose: bool = False,
-    ) -> None:
-        self.model_path = model_path
-        self.sys_prompt = sys_prompt
-        self.config = dict(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            n_gpu_layers=n_gpu_layers,
-            verbose=verbose,
-        )
-        self.llm: Optional[Llama] = None
-        self.messages: List[Dict[str, str]] = [
-            {"role": "system", "content": self.sys_prompt}
-        ]
-        self.mode: str = "base"
-        self.load_model()
-
-    # ---------- Model management ----------
-    def _guess_mode(self, filename: str) -> str:
-        """
-        Heuristic:
-          - use Chat API if file name clearly indicates an instruct/chat model,
-        """
-        name = os.path.basename(filename).lower()
-        looks_chat = any(k in name for k in ["chat", "instruct", "assistant", "alpaca", "vicuna", "zephyr", "openhermes", "orca"])
-        if looks_chat:
-            return "chat"
-        return "base"
-
-    def load_model(self) -> None:
-        self.llm = Llama(**self.config)
-        self.mode = self._guess_mode(self.model_path)
-        print(f"[Backend] Loaded: {self.model_path}  (mode={self.mode})")
-
-    def reset(self) -> None:
-        self.messages = [{"role": "system", "content": self.sys_prompt}]
-
-    # ---------- Helpers ----------
-    def _extract_text(self, out: Dict[str, Any]) -> str:
-        """
-        Robustly extract text from llama.cpp outputs (chat or text completion).
-        """
-        try:
-            choices = out.get("choices", [])
-            if not choices:
-                return ""
-            ch0 = choices[0]
-            # Chat format
-            if isinstance(ch0, dict) and "message" in ch0 and isinstance(ch0["message"], dict):
-                content = ch0["message"].get("content", "")
-                if content:
-                    return content
-            # Text format
-            if "text" in ch0:
-                txt = ch0.get("text", "")
-                if txt:
-                    return txt
-        except Exception as e:
-            print(f"[Backend] _extract_text error: {e}")
-        return ""
-
-    def _build_inst_prompt(self, user_input: str, history_max_pairs: int = 5) -> str:
-        """
-        Build a single [INST] prompt that contains a compact conversation summary.
-        This is forgiving across many 'base' style instruct models.
-        """
-        # Collect last history pairs (user, assistant) ignoring the system message
-        pairs: List[tuple[str, str]] = []
-        last_user: Optional[str] = None
-        for m in self.messages:
-            if m["role"] == "user":
-                last_user = m["content"]
-            elif m["role"] == "assistant" and last_user is not None:
-                pairs.append((last_user, m["content"]))
-                last_user = None
-        pairs = pairs[-history_max_pairs:]
-
-        header = f"<<SYS>>\n{self.sys_prompt}\n<</SYS>>\n"
-        conv = []
-        for u, a in pairs:
-            conv.append(f"User: {u}\nAssistant: {a}\n")
-        conv.append(f"User: {user_input}\nAssistant:")
-        body = header + "".join(conv)
-        prompt = f"[INST] {body} [/INST]"
-        return prompt
-
-    # ---------- Chat ----------
-    def chat(self, user_input: str, temperature: float = 0.8, top_p: float = 0.95, max_tokens: int = 512):
-        """
-        Generate a reply. Always returns (reply, dt_seconds, rss_mem_mb).
-        """
-        t0 = time.time()
-        reply = ""
-        try:
-            if self.mode == "chat":
-                # Full multi-turn context via Chat API
-                self.messages.append({"role": "user", "content": user_input})
-                out = self.llm.create_chat_completion(
-                    messages=self.messages,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    repeat_penalty=1.1,
-                )
-                reply = self._extract_text(out).strip()
-
-                # If some instruct models still give empty content under Chat API, try INST fallback
-                if not reply:
-                    prompt = self._build_inst_prompt(user_input)
-                    out = self.llm(
-                        prompt,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        repeat_penalty=1.1,
-                    )
-                    reply = self._extract_text(out).strip()
-
-                if reply:
-                    self.messages.append({"role": "assistant", "content": reply})
-
-            else:
-                # Base-style prompt using [INST] with a compact history
-                prompt = self._build_inst_prompt(user_input)
-                out = self.llm(
-                    prompt,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    repeat_penalty=1.1,
-                )
-                reply = self._extract_text(out).strip()
-                self.messages.append({"role": "user", "content": user_input})
-                self.messages.append({"role": "assistant", "content": reply or ""})
-
-        except Exception as e:
-            reply = f"[系统错误] {e}"
-            print(f"[Backend] Exception: {e}")
-
-        if not reply:
-            reply = "(模型没有返回内容)"
-
-        dt = time.time() - t0
-        mem = psutil.Process().memory_info().rss / (1024 ** 2)
-        return reply, dt, mem
+from chat_backend import ChatBot
 import threading
 import tkinter as tk
-from tkinter import scrolledtext, ttk
-
-# from chat_backend import ChatBot
+from tkinter import ttk
 
 # ========== Config ==========
+SYSTEM_PROMPT = "You are a helpful, concise assistant."
+PROCESS = psutil.Process()
+
+PRIMARY_BG = "#f5f6fa"
+CARD_BG = "#ffffff"
+ACCENT_COLOR = "#4c6ef5"
+ACCENT_HOVER = "#3b5bdb"
+TEXT_COLOR = "#1f2937"
+MUTED_TEXT = "#6b7280"
+USER_BG = ACCENT_COLOR
+ASSISTANT_BG = "#ffffff"
+SYSTEM_BG = "#eef2fb"
+
 MODEL_PATHS = {
     "Orca-Mini-3B": "./models/orca-mini-3b.Q4_0.gguf",
     "Mistral-7B-Instruct": "./models/mistral-7b-instruct.Q4_K_M.gguf",
@@ -183,23 +30,78 @@ MODEL_PATHS = {
 root = tk.Tk()
 root.title("本地 LLaMA 聊天机器人")
 root.geometry("950x750")
+root.configure(bg=PRIMARY_BG)
+
+style = ttk.Style()
+style.theme_use("clam")
+style.configure("Background.TFrame", background=PRIMARY_BG)
+style.configure("Card.TFrame", background=CARD_BG)
+style.configure("Header.TLabel", background=PRIMARY_BG, foreground=TEXT_COLOR, font=("Arial", 18, "bold"))
+style.configure("SubHeader.TLabel", background=PRIMARY_BG, foreground=MUTED_TEXT, font=("Arial", 11))
+style.configure("SliderTitle.TLabel", background=CARD_BG, foreground=TEXT_COLOR, font=("Arial", 11, "bold"))
+style.configure("SliderValue.TLabel", background=CARD_BG, foreground=ACCENT_COLOR, font=("Arial", 11))
+style.configure("Accent.TButton", background=ACCENT_COLOR, foreground="white", font=("Arial", 12, "bold"), padding=(14, 8), borderwidth=0, focusthickness=0)
+style.map("Accent.TButton", background=[("active", ACCENT_HOVER), ("disabled", "#d8ddf7")], foreground=[("disabled", "#f1f4ff")])
+style.configure("Secondary.TButton", background="#e9ecf5", foreground=TEXT_COLOR, font=("Arial", 11), padding=(12, 6), borderwidth=0)
+style.map("Secondary.TButton", background=[("active", "#dde3f9"), ("disabled", "#f0f2f9")], foreground=[("disabled", "#9da3b5")])
+style.configure("TCombobox", fieldbackground=CARD_BG, background=CARD_BG, foreground=TEXT_COLOR, padding=6)
+style.map("TCombobox", fieldbackground=[("readonly", CARD_BG)], selectbackground=[("readonly", CARD_BG)])
+style.configure("Minimal.Vertical.TScrollbar", background="#c3c8d9", troughcolor=CARD_BG, bordercolor=CARD_BG, arrowcolor=MUTED_TEXT, gripcount=0)
+style.map("Minimal.Vertical.TScrollbar", background=[("active", "#b0b9d3")])
+style.configure("Metric.Horizontal.TScale", troughcolor="#d8dce7", background=ACCENT_COLOR)
+style.map("Metric.Horizontal.TScale", background=[("active", ACCENT_HOVER)])
+style.configure("Accent.Horizontal.TProgressbar", troughcolor=CARD_BG, background=ACCENT_COLOR)
 
 # Create first bot
-bot = ChatBot(MODEL_PATHS["Mistral-7B-Instruct"])
+bot = ChatBot(MODEL_PATHS["Mistral-7B-Instruct"], system_prompt=SYSTEM_PROMPT)
+
+# Layout containers
+main_frame = ttk.Frame(root, style="Background.TFrame", padding=(24, 24, 24, 20))
+main_frame.grid(row=0, column=0, sticky="nsew")
+root.grid_rowconfigure(0, weight=1)
+root.grid_columnconfigure(0, weight=1)
+main_frame.grid_rowconfigure(1, weight=1)
+main_frame.grid_columnconfigure(0, weight=1)
+
+header_frame = ttk.Frame(main_frame, style="Background.TFrame")
+header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 18))
+
+title_label = ttk.Label(header_frame, text="本地 LLaMA 聊天机器人", style="Header.TLabel")
+title_label.pack(anchor="w")
+subtitle_label = ttk.Label(
+    header_frame,
+    text="在本地实验对话模型 · 调整参数探索不同响应",
+    style="SubHeader.TLabel",
+)
+subtitle_label.pack(anchor="w", pady=(4, 0))
+
+chat_container = ttk.Frame(main_frame, style="Card.TFrame", padding=18)
+chat_container.grid(row=1, column=0, sticky="nsew")
+chat_container.grid_rowconfigure(0, weight=1)
+chat_container.grid_columnconfigure(0, weight=1)
+
+controls_container = ttk.Frame(main_frame, style="Background.TFrame", padding=(0, 18, 0, 0))
+controls_container.grid(row=2, column=0, sticky="ew")
+controls_container.grid_columnconfigure(0, weight=1)
 
 def set_busy(is_busy: bool):
-    state = "disabled" if is_busy else "normal"
-    entry.configure(state=state)
-    send_button.configure(state=state)
-    clear_button.configure(state=state)
-    model_dropdown.configure(state="disabled" if is_busy else "readonly")
-    temperature_slider.configure(state=state)
-    top_p_slider.configure(state=state)
-    max_tokens_slider.configure(state=state)
+    entry.configure(state="disabled" if is_busy else "normal")
     if is_busy:
+        send_button.state(["disabled"])
+        clear_button.state(["disabled"])
+        model_dropdown.configure(state="disabled")
+        temperature_slider.state(["disabled"])
+        top_p_slider.state(["disabled"])
+        max_tokens_slider.state(["disabled"])
         progress_bar.grid()
         progress_bar.start()
     else:
+        send_button.state(["!disabled"])
+        clear_button.state(["!disabled"])
+        model_dropdown.configure(state="readonly")
+        temperature_slider.state(["!disabled"])
+        top_p_slider.state(["!disabled"])
+        max_tokens_slider.state(["!disabled"])
         progress_bar.stop()
         progress_bar.grid_remove()
 
@@ -209,17 +111,22 @@ def do_send():
         return
     entry.delete("1.0", "end")
     append(f"用户: {user_input}", "user")
+    set_busy(True)
 
     def worker():
-        set_busy(True)
         try:
-            reply, dt, mem = bot.chat(user_input, temperature=temperature_var.get(), top_p=top_p_var.get(), max_tokens=max_tokens_var.get())
+            reply, dt, mem = bot.chat(
+                user_input,
+                temperature=temperature_var.get(),
+                top_p=top_p_var.get(),
+                max_tokens=int(max_tokens_var.get()),
+            )
         except Exception as e:
             tb_str = traceback.format_exc()
             print(f"[Backend] Exception in chat: {tb_str}")
             reply = f"[系统错误] {e}"
             dt = 0.0
-            mem = psutil.Process().memory_info().rss / (1024 ** 2)
+            mem = PROCESS.memory_info().rss / (1024 ** 2)
         finally:
             def done():
                 append(f"助手: {reply}", "assistant")
@@ -231,6 +138,7 @@ def do_send():
 
 def on_return(event):
     do_send()
+    return "break"
 
 def do_clear():
     bot.reset()
@@ -242,39 +150,65 @@ def on_switch_model(event=None):
     model_name = model_var.get()
     new_path = MODEL_PATHS[model_name]
     append(f"[系统] 正在切换到 {model_name}...", "system")
+    set_busy(True)
 
     def worker():
-        set_busy(True)
         global bot
-        bot = ChatBot(new_path)
-        def done():
+        try:
+            new_bot = ChatBot(new_path, system_prompt=SYSTEM_PROMPT)
+        except Exception as err:
+            tb_str = traceback.format_exc()
+            print(f"[Backend] Failed to load model: {tb_str}")
+
+            def done_error():
+                append(f"[系统错误] 模型加载失败: {err}", "system")
+                set_busy(False)
+
+            root.after(0, done_error)
+            return
+
+        def done_success():
+            global bot
+            bot = new_bot
             append(f"[系统] 模型 {model_name} 已加载完成。", "system")
             set_busy(False)
-        root.after(0, done)
+
+        root.after(0, done_success)
 
     threading.Thread(target=worker, daemon=True).start()
 
 # ========== GUI Helpers ==========
 def add_bubble(text: str, sender: str):
     # sender in {"user","assistant","system"}
+    auto_scroll = True
+    try:
+        _, y_max = chat_canvas.yview()
+        auto_scroll = y_max >= 0.999
+    except tk.TclError:
+        auto_scroll = True
+
     if sender == "user":
-        bg = "#DCF2FF"   # light blue
+        bg = USER_BG
+        fg = "#ffffff"
         anchor = "e"
         justify = "left"
     elif sender == "assistant":
-        bg = "#F1F3F5"   # light gray
+        bg = ASSISTANT_BG
+        fg = TEXT_COLOR
         anchor = "w"
         justify = "left"
     else:
-        bg = "#EEEEEE"
+        bg = SYSTEM_BG
+        fg = MUTED_TEXT
         anchor = "center"
         justify = "center"
 
-    frame = tk.Frame(chat_frame, bg=bg, padx=8, pady=6)
+    frame = tk.Frame(chat_frame, bg=bg, padx=12, pady=8)
     lbl = tk.Label(
         frame,
         text=text,
         bg=bg,
+        fg=fg,
         justify=justify,
         wraplength=max(300, chat_canvas.winfo_width() - 140),
         font=("Arial", 12),
@@ -286,7 +220,8 @@ def add_bubble(text: str, sender: str):
     else:
         lbl.pack(fill="both", expand=True)
     ts = time.strftime("%H:%M")
-    ts_lbl = tk.Label(frame, text=ts, bg=bg, fg="#777", font=("Arial", 9))
+    ts_color = "#dbe4ff" if sender == "user" else MUTED_TEXT
+    ts_lbl = tk.Label(frame, text=ts, bg=bg, fg=ts_color, font=("Arial", 9))
     ts_lbl.pack(anchor="e")
     # pack bubble to left/right
     if anchor == "center":
@@ -295,7 +230,8 @@ def add_bubble(text: str, sender: str):
         frame.pack(anchor=anchor, pady=6, padx=10, fill="x")
 
     chat_canvas.update_idletasks()
-    chat_canvas.yview_moveto(1.0)
+    if auto_scroll:
+        chat_canvas.yview_moveto(1.0)
 
 def append(text: str, tag: str = None):
     # tag: "user" | "assistant" | "system"
@@ -303,18 +239,28 @@ def append(text: str, tag: str = None):
     add_bubble(text, sender)
 
 # Chat area: Canvas + inner Frame + Scrollbar (for bubble layout)
-chat_canvas = tk.Canvas(root, highlightthickness=0)
-chat_scrollbar = ttk.Scrollbar(root, orient="vertical", command=chat_canvas.yview)
-chat_frame = tk.Frame(chat_canvas)
+chat_canvas = tk.Canvas(
+    chat_container,
+    highlightthickness=0,
+    bd=0,
+    relief="flat",
+    background=CARD_BG,
+)
+chat_scrollbar = ttk.Scrollbar(
+    chat_container,
+    orient="vertical",
+    command=chat_canvas.yview,
+    style="Minimal.Vertical.TScrollbar",
+)
+chat_frame = tk.Frame(chat_canvas, bg=CARD_BG)
 
 # attach frame to canvas
-chat_window = chat_canvas.create_window((0, 0), window=chat_frame, anchor="nw", width=chat_canvas.winfo_width())
+chat_window = chat_canvas.create_window((0, 0), window=chat_frame, anchor="nw")
 chat_canvas.configure(yscrollcommand=chat_scrollbar.set)
 chat_scrollbar.config(command=chat_canvas.yview)
 
 def _on_frame_config(event=None):
     chat_canvas.configure(scrollregion=chat_canvas.bbox("all"))
-    chat_canvas.yview_moveto(1.0)
 
 chat_frame.bind("<Configure>", _on_frame_config)
 
@@ -325,71 +271,160 @@ chat_canvas.bind("<Configure>", _on_canvas_config)
 
 # mouse wheel scroll with enable/disable on enter/leave
 def _on_mousewheel(event):
-    scroll_units = int(-1 * (event.delta / 120))
-    chat_canvas.yview_scroll(scroll_units, "units")
+    if event.delta:
+        if abs(event.delta) < 120:
+            step = -1 if event.delta > 0 else 1
+        else:
+            step = int(-event.delta / 120)
+        chat_canvas.yview_scroll(step, "units")
+
+
+def _on_linux_scroll(event):
+    step = -1 if event.num == 4 else 1
+    chat_canvas.yview_scroll(step, "units")
+
 
 def _bind_mousewheel(event):
     chat_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    chat_canvas.bind_all("<Button-4>", _on_linux_scroll)
+    chat_canvas.bind_all("<Button-5>", _on_linux_scroll)
+
 
 def _unbind_mousewheel(event):
     chat_canvas.unbind_all("<MouseWheel>")
+    chat_canvas.unbind_all("<Button-4>")
+    chat_canvas.unbind_all("<Button-5>")
+
 
 chat_canvas.bind("<Enter>", _bind_mousewheel)
 chat_canvas.bind("<Leave>", _unbind_mousewheel)
 
-chat_canvas.grid(row=0, column=0, columnspan=4, padx=10, pady=10, sticky="nsew")
-chat_scrollbar.grid(row=0, column=4, padx=(0,10), pady=10, sticky="ns")
+chat_canvas.grid(row=0, column=0, sticky="nsew")
+chat_scrollbar.grid(row=0, column=1, padx=(12, 0), sticky="ns")
 
-entry = tk.Text(root, font=("Arial", 12), height=3)
-entry.grid(row=1, column=0, columnspan=3, padx=10, pady=5, sticky="ew")
+# Input card with message box and actions
+input_card = ttk.Frame(controls_container, style="Card.TFrame", padding=(16, 14))
+input_card.grid(row=0, column=0, sticky="ew")
+input_card.grid_columnconfigure(0, weight=1)
+
+entry = tk.Text(
+    input_card,
+    font=("Arial", 12),
+    height=3,
+    wrap="word",
+    relief="flat",
+    bd=0,
+    highlightthickness=0,
+)
+entry.configure(bg=CARD_BG, fg=TEXT_COLOR, insertbackground=TEXT_COLOR)
+entry.grid(row=0, column=0, rowspan=2, padx=(0, 16), sticky="nsew")
 entry.bind("<Return>", on_return)            # Enter 发送
 entry.bind("<Shift-Return>", lambda e: entry.insert("insert", "\n"))  # Shift+Enter 换行
 
-send_button = tk.Button(root, text="发送", width=10, command=do_send)
-send_button.grid(row=1, column=3, padx=10, pady=(5, 2), sticky="ew")
+send_button = ttk.Button(input_card, text="发送", command=do_send, style="Accent.TButton")
+send_button.grid(row=0, column=1, sticky="ew")
 
-clear_button = tk.Button(root, text="清空", width=10, command=do_clear)
-clear_button.grid(row=2, column=3, padx=10, pady=(2, 5), sticky="ew")
+clear_button = ttk.Button(input_card, text="清空", command=do_clear, style="Secondary.TButton")
+clear_button.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+# Model selector row
+model_row = ttk.Frame(controls_container, style="Background.TFrame")
+model_row.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+model_row.grid_columnconfigure(0, weight=1)
 
 model_var = tk.StringVar(value="Mistral-7B-Instruct")
-model_dropdown = ttk.Combobox(root, textvariable=model_var, values=["Orca-Mini-3B", "Mistral-7B-Instruct"], state="readonly")
+model_dropdown = ttk.Combobox(
+    model_row,
+    textvariable=model_var,
+    values=["Orca-Mini-3B", "Mistral-7B-Instruct"],
+    state="readonly",
+)
 model_dropdown.bind("<<ComboboxSelected>>", on_switch_model)
-model_dropdown.grid(row=2, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
+model_dropdown.grid(row=0, column=0, sticky="ew")
 
-progress_bar = ttk.Progressbar(root, mode="indeterminate")
-progress_bar.grid(row=2, column=4, padx=10, pady=10, sticky="e")
+progress_bar = ttk.Progressbar(
+    model_row,
+    mode="indeterminate",
+    style="Accent.Horizontal.TProgressbar",
+    length=160,
+)
+progress_bar.grid(row=0, column=1, padx=(16, 0))
 progress_bar.grid_remove()
 
-# Add sliders for temperature, top_p, max_tokens in a dedicated frame
-slider_frame = tk.Frame(root)
-slider_frame.grid(row=3, column=0, columnspan=5, padx=10, pady=10, sticky="ew")
-
-slider_frame.grid_columnconfigure(0, weight=1)
-slider_frame.grid_columnconfigure(1, weight=1)
-slider_frame.grid_columnconfigure(2, weight=1)
+# Slider card for parameters
+slider_card = ttk.Frame(controls_container, style="Card.TFrame", padding=(16, 14))
+slider_card.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+slider_card.grid_columnconfigure(0, weight=1, uniform="slider")
+slider_card.grid_columnconfigure(1, weight=1, uniform="slider")
+slider_card.grid_columnconfigure(2, weight=1, uniform="slider")
 
 temperature_var = tk.DoubleVar(value=0.8)
 top_p_var = tk.DoubleVar(value=0.95)
-max_tokens_var = tk.IntVar(value=512)
+max_tokens_var = tk.DoubleVar(value=512)
 
-temperature_label = tk.Label(slider_frame, text="Temperature")
-temperature_label.grid(row=0, column=0, padx=10, pady=(0, 2), sticky="w")
-temperature_slider = tk.Scale(slider_frame, variable=temperature_var, from_=0.0, to=2.0, resolution=0.01, orient="horizontal")
-temperature_slider.grid(row=1, column=0, padx=10, pady=(0, 5), sticky="ew")
 
-top_p_label = tk.Label(slider_frame, text="Top-p")
-top_p_label.grid(row=0, column=1, padx=10, pady=(0, 2), sticky="w")
-top_p_slider = tk.Scale(slider_frame, variable=top_p_var, from_=0.0, to=1.0, resolution=0.01, orient="horizontal")
-top_p_slider.grid(row=1, column=1, padx=10, pady=(0, 5), sticky="ew")
+def _build_slider(parent, column, title, variable, minimum, maximum, formatter):
+    container = ttk.Frame(parent, style="Card.TFrame")
+    container.grid(row=0, column=column, sticky="ew", padx=4)
+    container.grid_columnconfigure(0, weight=1)
+    container.grid_columnconfigure(1, weight=0)
 
-max_tokens_label = tk.Label(slider_frame, text="Max Tokens")
-max_tokens_label.grid(row=0, column=2, padx=10, pady=(0, 2), sticky="w")
-max_tokens_slider = tk.Scale(slider_frame, variable=max_tokens_var, from_=1, to=2048, orient="horizontal")
-max_tokens_slider.grid(row=1, column=2, padx=10, pady=(0, 5), sticky="ew")
+    title_label = ttk.Label(container, text=title, style="SliderTitle.TLabel")
+    title_label.grid(row=0, column=0, sticky="w")
 
-# Make layout flexible
-root.grid_rowconfigure(0, weight=1)
-root.grid_columnconfigure(0, weight=1)
+    value_label = ttk.Label(container, text=formatter(variable.get()), style="SliderValue.TLabel")
+    value_label.grid(row=0, column=1, sticky="e")
+
+    scale = ttk.Scale(
+        container,
+        variable=variable,
+        from_=minimum,
+        to=maximum,
+        orient="horizontal",
+        style="Metric.Horizontal.TScale",
+    )
+
+    def _update(value):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = variable.get()
+        value_label.configure(text=formatter(numeric))
+
+    scale.configure(command=_update)
+    scale.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    return scale
+
+
+temperature_slider = _build_slider(
+    slider_card,
+    0,
+    "Temperature",
+    temperature_var,
+    0.0,
+    2.0,
+    lambda v: f"{float(v):.2f}",
+)
+
+top_p_slider = _build_slider(
+    slider_card,
+    1,
+    "Top-p",
+    top_p_var,
+    0.0,
+    1.0,
+    lambda v: f"{float(v):.2f}",
+)
+
+max_tokens_slider = _build_slider(
+    slider_card,
+    2,
+    "Max Tokens",
+    max_tokens_var,
+    1,
+    2048,
+    lambda v: str(int(float(v))),
+)
 
 append("[系统] 界面已就绪。按 Enter 发送消息；下拉框可切换模型。", "system")
 
